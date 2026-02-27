@@ -1,0 +1,269 @@
+"""
+VR 全景图（等距柱状投影 equirectangular）转 9:16 平面视频
+- 6 张 2048x2048 图片，按顺序播放
+- 使用 FFmpeg v360 滤镜 + sendcmd 文件实现运镜（yaw/pitch 动画）
+- 不使用 eval=frame 选项
+- 适用于 Windows CMD
+
+依赖：
+  - Python 3.x
+  - FFmpeg（需在 PATH 中，或修改 FFMPEG 变量为完整路径）
+
+用法：
+  python vr_to_video.py
+
+图片命名规则（默认）：
+  img1.jpg, img2.jpg, img3.jpg, img4.jpg, img5.jpg, img6.jpg
+  （可在下方 IMAGE_FILES 列表中修改）
+"""
+
+import subprocess
+import os
+import math
+
+# ─────────────────────────────────────────────
+# 用户配置区
+# ─────────────────────────────────────────────
+
+# FFmpeg 可执行文件路径（如已在 PATH 中直接写 "ffmpeg"）
+FFMPEG = "ffmpeg"
+
+# 6 张输入图片路径（顺序排列）
+IMAGE_FILES = [
+    "img1.jpg",
+    "img2.jpg",
+    "img3.jpg",
+    "img4.jpg",
+    "img5.jpg",
+    "img6.jpg",
+]
+
+# 输出视频
+OUTPUT_VIDEO = "output_vr.mp4"
+
+# 每张图持续秒数
+DURATION_PER_IMAGE = 5.0
+
+# 输出分辨率（9:16）
+OUT_W = 1080
+OUT_H = 1920
+
+# 帧率
+FPS = 30
+
+# v360 水平视野角（度），越小越"拉近"，推荐 60~100
+HFOV = 80.0
+
+# ─────────────────────────────────────────────
+# 每张图的运镜定义：(起始yaw, 起始pitch, 结束yaw, 结束pitch)
+# yaw:   水平旋转，-180~180，正值向右
+# pitch: 垂直旋转，-90~90，正值向上
+# ─────────────────────────────────────────────
+CAMERA_MOVES = [
+    # 图1：从左向右缓慢平移
+    (-20.0,  5.0,  20.0,  5.0),
+    # 图2：从右向左 + 稍微下俯
+    ( 25.0,  0.0, -10.0, -8.0),
+    # 图3：正面慢慢抬头
+    (  0.0, -10.0,  0.0, 15.0),
+    # 图4：左下扫向右上（对角运镜）
+    (-30.0, -10.0, 20.0, 10.0),
+    # 图5：顺时针绕一小圈（先右后左，配合俯仰）
+    ( 15.0,  10.0, -15.0, -5.0),
+    # 图6：正面缓缓拉近感（通过减小 HFOV 模拟，yaw 保持不动）
+    (  0.0,  0.0,   0.0,  0.0),
+]
+
+# ─────────────────────────────────────────────
+# 辅助：线性插值
+# ─────────────────────────────────────────────
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+# ─────────────────────────────────────────────
+# 步骤 1：生成 sendcmd 文件
+# sendcmd 格式（基于时间）：
+#   <时间戳>, <滤镜标签> <参数名> <值>;
+#
+# v360 支持 sendcmd 动态修改的参数（FFmpeg 4.4+）：
+#   yaw, pitch, roll（单位：度）
+#   h_fov（水平视野，度）
+#
+# sendcmd 按时间点插值，不是按帧，所以我们每秒打若干个关键帧即可。
+# ─────────────────────────────────────────────
+def generate_sendcmd(cmd_file: str):
+    """
+    为每个图片片段生成 sendcmd 关键帧。
+    FFmpeg sendcmd 文件格式：
+        <time> [enter] <filterlabel> <option> <value>;
+    两个关键帧之间 FFmpeg 会线性插值（需要 FFmpeg 使用内插模式）。
+
+    注意：v360 的 sendcmd 支持需要 FFmpeg >= 4.4，
+    插值模式写法：
+        <time> [enter] [interp_start=<t1>] [interp_end=<t2>] <label> <opt> <val>;
+    但标准 sendcmd 不做插值，只在到达时间点时跳变。
+    因此我们每秒生成多个关键帧来模拟平滑运动。
+    """
+    KEYFRAME_INTERVAL = 1.0 / 10  # 每 0.1 秒一个关键帧（足够平滑）
+
+    lines = []
+    total_images = len(IMAGE_FILES)
+
+    for img_idx in range(total_images):
+        y0, p0, y1, p1 = CAMERA_MOVES[img_idx]
+        img_start = img_idx * DURATION_PER_IMAGE
+
+        # 生成该片段的关键帧
+        steps = int(DURATION_PER_IMAGE / KEYFRAME_INTERVAL) + 1
+        for step in range(steps):
+            t_local = step * KEYFRAME_INTERVAL
+            if t_local > DURATION_PER_IMAGE:
+                t_local = DURATION_PER_IMAGE
+            t_global = img_start + t_local
+            frac = t_local / DURATION_PER_IMAGE
+
+            yaw   = lerp(y0, y1, frac)
+            pitch = lerp(p0, p1, frac)
+
+            # sendcmd 格式（FFmpeg 官方文档）
+            # 时间单位：秒（浮点）
+            lines.append(f"{t_global:.3f} [enter] v360_filter yaw {yaw:.4f};")
+            lines.append(f"{t_global:.3f} [enter] v360_filter pitch {pitch:.4f};")
+
+    with open(cmd_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"[OK] sendcmd 文件已生成：{cmd_file}，共 {len(lines)} 条指令")
+
+# ─────────────────────────────────────────────
+# 步骤 2：构建 FFmpeg 命令
+#
+# 方案：
+#   1. 用 concat demuxer 把 6 张图片拼接成一段连续流
+#      每张图持续 DURATION_PER_IMAGE 秒
+#   2. 对拼接后的流应用 v360 滤镜（equirectangular -> rectilinear）
+#   3. 用 sendcmd 滤镜在运行时动态修改 v360 的 yaw/pitch
+#   4. 缩放到 9:16 输出
+#
+# v360 关键参数（官方文档）：
+#   input=e       等距柱状投影（equirectangular）
+#   output=flat   平面透视投影（rectilinear）
+#   h_fov         水平视野角（度）
+#   v_fov         垂直视野角（度，通常由 h_fov 和输出比例自动推导）
+#   yaw/pitch/roll 朝向（度）
+#
+# sendcmd 滤镜：
+#   f=<file>      指定命令文件
+# ─────────────────────────────────────────────
+def generate_concat_file(concat_file: str):
+    """生成 FFmpeg concat demuxer 列表文件"""
+    lines = []
+    for img in IMAGE_FILES:
+        # Windows 路径中反斜杠需转义，或统一用正斜杠
+        img_path = img.replace("\\", "/")
+        lines.append(f"file '{img_path}'")
+        lines.append(f"duration {DURATION_PER_IMAGE}")
+
+    # concat demuxer 要求最后一个文件重复写一次（无 duration）以避免最后一帧截断
+    last = IMAGE_FILES[-1].replace("\\", "/")
+    lines.append(f"file '{last}'")
+
+    with open(concat_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"[OK] concat 列表已生成：{concat_file}")
+
+
+def build_ffmpeg_command(concat_file: str, cmd_file: str) -> list:
+    """
+    构建 FFmpeg 命令列表。
+
+    滤镜图说明：
+      [0:v] -> sendcmd -> v360 -> scale -> [out]
+
+    sendcmd 通过 f=<file> 加载时间轴命令，在运行时向 v360_filter 发送
+    yaw/pitch 更新（使用 FFmpeg filtergraph 的 send_command 机制）。
+
+    注意：sendcmd 修改的目标滤镜名称必须与 filtergraph 中的 @标签 一致。
+    这里我们将 v360 命名为 v360_filter（通过 @v360_filter 语法）。
+    """
+
+    # 计算 v_fov（由 h_fov 和输出宽高比推算）
+    # tan(v_fov/2) = tan(h_fov/2) * (H/W)
+    h_fov_rad = math.radians(HFOV)
+    v_fov_rad = 2 * math.atan(math.tan(h_fov_rad / 2) * OUT_H / OUT_W)
+    v_fov = math.degrees(v_fov_rad)
+
+    # FFmpeg filtergraph
+    # sendcmd=f=<cmd_file> 会向标签为 v360_filter 的滤镜发送命令
+    filtergraph = (
+        f"sendcmd=f={cmd_file},"
+        f"[v360_filter] v360=e:flat:h_fov={HFOV:.2f}:v_fov={v_fov:.2f}"
+        f":w={OUT_W}:h={OUT_H}:yaw=0:pitch=0:roll=0,"
+        f"scale={OUT_W}:{OUT_H}:flags=lanczos"
+    )
+
+    # 注意 Windows CMD 下引号处理：使用双引号包裹 filtergraph
+    cmd = [
+        FFMPEG,
+        "-y",                          # 覆盖输出
+        "-f", "concat",
+        "-safe", "0",                  # 允许相对路径
+        "-i", concat_file,
+        "-vf", filtergraph,
+        "-r", str(FPS),
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-an",                         # 无音频
+        OUTPUT_VIDEO,
+    ]
+    return cmd
+
+
+# ─────────────────────────────────────────────
+# 主流程
+# ─────────────────────────────────────────────
+def main():
+    # 检查图片文件是否存在
+    missing = [f for f in IMAGE_FILES if not os.path.isfile(f)]
+    if missing:
+        print("[警告] 以下文件不存在，请检查路径：")
+        for m in missing:
+            print(f"  - {m}")
+        print("继续生成脚本文件，但 FFmpeg 运行时可能报错。")
+
+    concat_file = "vr_concat.txt"
+    cmd_file    = "vr_sendcmd.txt"
+
+    # 生成辅助文件
+    generate_concat_file(concat_file)
+    generate_sendcmd(cmd_file)
+
+    # 构建并执行 FFmpeg
+    cmd = build_ffmpeg_command(concat_file, cmd_file)
+
+    print("\n[CMD] FFmpeg 命令：")
+    print(" ".join(cmd))
+    print("\n[INFO] 开始执行 FFmpeg ...\n")
+
+    result = subprocess.run(cmd, text=True)
+
+    if result.returncode == 0:
+        print(f"\n[完成] 视频已输出：{OUTPUT_VIDEO}")
+    else:
+        print(f"\n[错误] FFmpeg 返回码 {result.returncode}")
+        print("请检查上方 FFmpeg 输出的错误信息。")
+        print("常见问题：")
+        print("  1. FFmpeg 版本太旧（需要 >= 4.4），请更新 FFmpeg")
+        print("  2. v360 滤镜不支持 sendcmd 动态参数（见下方备用方案）")
+        print("  3. 图片路径错误")
+
+    # 清理临时文件（可选，注释掉以保留调试文件）
+    # os.remove(concat_file)
+    # os.remove(cmd_file)
+
+
+if __name__ == "__main__":
+    main()
