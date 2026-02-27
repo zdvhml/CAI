@@ -1,0 +1,81 @@
+import requests
+import os
+import re
+
+def download_images(base_url):
+    """
+    根据基础网址自动下载六张图片并重命名
+    支持任意数字前缀：0_u.jpg / 1_u.jpg / 2_u.jpg ...
+    保存目录自动跟随前缀：images0 / images1 / images2 ...
+    示例输入：www.xxx.com/222/333/1_u.jpg（任意一张图片的网址）
+    """
+
+    # 确保网址包含协议头
+    if not base_url.startswith("http"):
+        base_url = "https://" + base_url
+
+    # 提取目录路径和文件名
+    base_dir, filename = base_url.rsplit("/", 1)
+
+    # 自动识别文件名中的数字前缀，例如 0_u.jpg → 0，1_u.jpg → 1，2_u.jpg → 2
+    match = re.match(r"^(\d+)_[a-z]+\.jpg$", filename, re.IGNORECASE)
+    if not match:
+        print("❌ 无法识别文件名格式，请确保格式为：数字_字母.jpg（如 0_u.jpg、1_u.jpg）")
+        return
+
+    prefix = match.group(1)
+    print(f"🔍 检测到文件前缀：{prefix}_\n")
+
+    # 定义后缀 -> 新文件名映射（前缀自动跟随输入网址变化）
+    file_map = {
+        f"{prefix}_u.jpg": "uu.jpg",
+        f"{prefix}_l.jpg": "ll.jpg",
+        f"{prefix}_r.jpg": "rr.jpg",
+        f"{prefix}_d.jpg": "dd.jpg",
+        f"{prefix}_b.jpg": "bb.jpg",
+        f"{prefix}_a.jpg": "aa.jpg",
+    }
+
+    # 保存目录自动跟随前缀：images0 / images1 / images2 ...
+    save_dir = f"images{prefix}"
+    os.makedirs(save_dir, exist_ok=True)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    print(f"📂 保存目录：{os.path.abspath(save_dir)}\n")
+
+    for original_name, new_name in file_map.items():
+        url = f"{base_dir}/{original_name}"
+        save_path = os.path.join(save_dir, new_name)
+
+        try:
+            print(f"⬇️  正在下载：{url}")
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            with open(save_path, "wb") as f:
+                f.write(response.content)
+
+            size_kb = len(response.content) / 1024
+            print(f"   ✅ 已保存为：{save_dir}/{new_name}（{size_kb:.1f} KB）\n")
+
+        except requests.exceptions.HTTPError as e:
+            print(f"   ❌ HTTP 错误：{e}\n")
+        except requests.exceptions.ConnectionError:
+            print(f"   ❌ 连接失败，请检查网址是否正确\n")
+        except requests.exceptions.Timeout:
+            print(f"   ❌ 请求超时\n")
+        except Exception as e:
+            print(f"   ❌ 未知错误：{e}\n")
+
+    print(f"🎉 下载任务完成！文件已保存至 {save_dir}/")
+
+
+if __name__ == "__main__":
+    # ✏️ 粘贴任意一张图片的网址，脚本自动识别前缀、目录和文件名
+    user_url = input("请输入任意一张图片的网址（例如：www.xxx.com/222/333/2_u.jpg）：\n> ").strip()
+    download_images(user_url)
