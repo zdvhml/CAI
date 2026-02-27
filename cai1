@@ -1,0 +1,250 @@
+"""
+VR Cubemap (6x 2048x2048) -> 9:16 平面视频（透视投影 + 运镜）
+运行环境: Python 3.x + numpy + Pillow
+安装依赖: pip install numpy Pillow
+
+立方体贴图文件顺序 (OpenGL 标准):
+  right.png  (+X)
+  left.png   (-X)
+  top.png    (+Y)
+  bottom.png (-Y)
+  front.png  (+Z)
+  back.png   (-Z)
+
+输出: frames/ 目录下的 PNG 序列，再用 FFmpeg 合成视频
+"""
+
+import numpy as np
+from PIL import Image
+import os
+import math
+
+# ─────────────────────────────────────────
+# 配置区
+# ─────────────────────────────────────────
+CUBEMAP_DIR  = "."        # 立方体贴图所在目录
+OUTPUT_DIR   = "frames"   # 输出帧目录
+
+OUT_W, OUT_H = 1080, 1920 # 9:16 竖屏分辨率
+FPS          = 30
+DURATION_SEC = 10         # 视频总时长（秒）
+
+TOTAL_FRAMES = FPS * DURATION_SEC
+
+# 立方体贴图文件名
+FACE_FILES = {
+    "right":  "right.png",
+    "left":   "left.png",
+    "top":    "top.png",
+    "bottom": "bottom.png",
+    "front":  "front.png",
+    "back":   "back.png",
+}
+
+# ─────────────────────────────────────────
+# 运镜关键帧: (时间秒, yaw度, pitch度, fov度)
+# yaw  : 水平旋转，0=正前方(+Z)，正值向右
+# pitch: 垂直旋转，0=水平，正值向上
+# fov  : 水平视场角，越小越"拉近"
+# ─────────────────────────────────────────
+KEYFRAMES = [
+    ( 0,   0,    0,  90),
+    ( 2,  30,    5,  85),
+    ( 4,  60,  -10,  80),
+    ( 6,  90,    0,  75),
+    ( 8, 120,   15,  85),
+    (10, 180,    0,  90),
+]
+
+# ─────────────────────────────────────────
+# 插值工具
+# ─────────────────────────────────────────
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def smoothstep(t):
+    return t * t * (3.0 - 2.0 * t)
+
+def interp_keyframes(frame_idx):
+    """根据帧号插值得到 (yaw, pitch, fov)"""
+    t_sec = frame_idx / FPS
+    for i in range(len(KEYFRAMES) - 1):
+        t0, yaw0, pitch0, fov0 = KEYFRAMES[i]
+        t1, yaw1, pitch1, fov1 = KEYFRAMES[i + 1]
+        if t0 <= t_sec <= t1:
+            alpha = smoothstep((t_sec - t0) / (t1 - t0))
+            return (
+                lerp(yaw0,   yaw1,   alpha),
+                lerp(pitch0, pitch1, alpha),
+                lerp(fov0,   fov1,   alpha),
+            )
+    return KEYFRAMES[-1][1], KEYFRAMES[-1][2], KEYFRAMES[-1][3]
+
+# ─────────────────────────────────────────
+# 立方体贴图加载
+# ─────────────────────────────────────────
+def load_cubemap(directory, face_files):
+    faces = {}
+    for name, filename in face_files.items():
+        path = os.path.join(directory, filename)
+        img = Image.open(path).convert("RGB")
+        faces[name] = np.array(img, dtype=np.uint8)
+        print("  加载 {}: {}".format(name, img.size))
+    return faces
+
+# ─────────────────────────────────────────
+# 立方体贴图采样
+# ─────────────────────────────────────────
+def sample_face_pixels(face_img, u_arr, v_arr):
+    """
+    face_img : np.array shape (H, W, 3)
+    u_arr, v_arr : 1-D float array, 值域 [-1, 1]
+    返回 (N, 3) uint8
+    """
+    h, w = face_img.shape[:2]
+    px = np.clip(((u_arr + 1.0) * 0.5 * (w - 1)).astype(np.int32), 0, w - 1)
+    py = np.clip(((1.0 - (v_arr + 1.0) * 0.5) * (h - 1)).astype(np.int32), 0, h - 1)
+    return face_img[py, px]
+
+
+def sample_cubemap(faces, dirs):
+    """
+    faces : dict {face_name: np.array (H,W,3)}
+    dirs  : (N, 3) float32 单位方向向量
+    返回  : (N, 3) uint8
+    """
+    x = dirs[:, 0]
+    y = dirs[:, 1]
+    z = dirs[:, 2]
+    abs_x = np.abs(x)
+    abs_y = np.abs(y)
+    abs_z = np.abs(z)
+
+    result = np.zeros((len(dirs), 3), dtype=np.uint8)
+
+    # +X  right
+    mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x > 0)
+    if mask.any():
+        sc = x[mask]
+        result[mask] = sample_face_pixels(faces["right"], -z[mask] / sc, y[mask] / sc)
+
+    # -X  left
+    mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x <= 0)
+    if mask.any():
+        sc = -x[mask]
+        result[mask] = sample_face_pixels(faces["left"], z[mask] / sc, y[mask] / sc)
+
+    # +Y  top
+    mask = (abs_y > abs_x) & (abs_y >= abs_z) & (y > 0)
+    if mask.any():
+        sc = y[mask]
+        result[mask] = sample_face_pixels(faces["top"], x[mask] / sc, -z[mask] / sc)
+
+    # -Y  bottom
+    mask = (abs_y > abs_x) & (abs_y >= abs_z) & (y <= 0)
+    if mask.any():
+        sc = -y[mask]
+        result[mask] = sample_face_pixels(faces["bottom"], x[mask] / sc, z[mask] / sc)
+
+    # +Z  front
+    mask = (abs_z > abs_x) & (abs_z > abs_y) & (z > 0)
+    if mask.any():
+        sc = z[mask]
+        result[mask] = sample_face_pixels(faces["front"], x[mask] / sc, y[mask] / sc)
+
+    # -Z  back
+    mask = (abs_z > abs_x) & (abs_z > abs_y) & (z <= 0)
+    if mask.any():
+        sc = -z[mask]
+        result[mask] = sample_face_pixels(faces["back"], -x[mask] / sc, y[mask] / sc)
+
+    return result
+
+# ─────────────────────────────────────────
+# 帧渲染
+# ─────────────────────────────────────────
+def render_frame(faces, yaw_deg, pitch_deg, fov_deg, out_w, out_h):
+    """
+    透视投影渲染单帧。
+    yaw_deg  : 水平旋转角（度），绕 Y 轴
+    pitch_deg: 垂直旋转角（度），绕 X 轴
+    fov_deg  : 水平视场角（度）
+    """
+    yaw   = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    fov   = math.radians(fov_deg)
+
+    # 焦距（像素单位）
+    f = (out_w / 2.0) / math.tan(fov / 2.0)
+
+    # 像素网格
+    px_x = np.arange(out_w, dtype=np.float32) - out_w / 2.0 + 0.5
+    px_y = np.arange(out_h, dtype=np.float32) - out_h / 2.0 + 0.5
+    gx, gy = np.meshgrid(px_x, px_y)
+
+    # 相机空间方向向量（右手系，Z 朝前，Y 朝上）
+    dx = gx
+    dy = -gy
+    dz = np.full_like(gx, f)
+
+    # 归一化
+    norm = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dx = dx / norm
+    dy = dy / norm
+    dz = dz / norm
+
+    # 旋转：先绕 X 轴（pitch），再绕 Y 轴（yaw）
+    cp = math.cos(pitch)
+    sp = math.sin(pitch)
+    cy = math.cos(yaw)
+    sy = math.sin(yaw)
+
+    # Rx(pitch)
+    dy2 =  cp * dy - sp * dz
+    dz2 =  sp * dy + cp * dz
+
+    # Ry(yaw)
+    dx3 =  cy * dx + sy * dz2
+    dz3 = -sy * dx + cy * dz2
+
+    # 展平为 (N, 3)
+    flat_dirs = np.stack(
+        [dx3.ravel(), dy2.ravel(), dz3.ravel()], axis=1
+    ).astype(np.float32)
+
+    # 采样
+    colors = sample_cubemap(faces, flat_dirs)
+    frame  = colors.reshape(out_h, out_w, 3)
+    return Image.fromarray(frame, "RGB")
+
+# ─────────────────────────────────────────
+# 主程序
+# ─────────────────────────────────────────
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("加载立方体贴图...")
+    faces = load_cubemap(CUBEMAP_DIR, FACE_FILES)
+
+    print("渲染 {} 帧 ({}x{}, {}fps, {}s)...".format(
+        TOTAL_FRAMES, OUT_W, OUT_H, FPS, DURATION_SEC))
+
+    for i in range(TOTAL_FRAMES):
+        yaw, pitch, fov = interp_keyframes(i)
+        frame_img = render_frame(faces, yaw, pitch, fov, OUT_W, OUT_H)
+
+        out_path = os.path.join(OUTPUT_DIR, "frame_{:05d}.png".format(i))
+        frame_img.save(out_path)
+
+        if i % FPS == 0:
+            print("  帧 {:4d}/{:4d}  yaw={:.1f} pitch={:.1f} fov={:.1f}".format(
+                i, TOTAL_FRAMES, yaw, pitch, fov))
+
+    print("渲染完成！帧序列保存至: {}/".format(OUTPUT_DIR))
+    print()
+    print("下一步 —— 在 CMD 中运行以下命令合成视频:")
+    print("  ffmpeg -framerate {} -i {}/frame_%05d.png -c:v libx264 -pix_fmt yuv420p -crf 18 output.mp4".format(
+        FPS, OUTPUT_DIR))
+
+
+if __name__ == "__main__":
